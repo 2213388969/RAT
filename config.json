@@ -1,0 +1,23 @@
+{
+  "poll_interval": 0.35,
+  "jpeg_quality": 60,
+  "diff_threshold": 8.0,
+  "chat_top_ratio": 0.1,
+  "chat_bottom_ratio": 0.22,
+  "chat_side_margin_ratio": 0.04,
+  "area_threshold": 30000,
+  "time_threshold": 3.0,
+  "accumulation_ratio": 0.8,
+  "dynamic_frames": 3,
+  "dynamic_cooldown": 0.8,
+  "dynamic_block_size": 64,
+  "cursor_mask_size": 32,
+  "text_cursor_max_area": 64,
+  "dirty_rect_merge_gap": 16,
+  "dirty_rect_min_size": 32,
+  "dirty_rect_merge_window_ms": 120,
+  "config_poll_interval": 30,
+  "windows": [
+    "\u5fae\u4fe1"
+  ]
+}
