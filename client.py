@@ -379,19 +379,25 @@ def detect_chat_region(image: Image.Image, software: str = "wechat") -> ChatRegi
         divider_col = 0
 
     # --- 2. Find horizontal divider (messages | input box) ---
-    # Strategy: WeChat's message area is bright white (~250), and the input box
-    # area below is noticeably darker gray (~235). The boundary between them is
-    # a thin separator line. We look for the biggest sustained brightness DROP
-    # scanning from bottom to top within the bottom portion of the window.
+    # Strategy: WeChat has a thin uniform separator line between the message
+    # area and the input box. This line is:
+    #   - Dark (low brightness)
+    #   - Uniform across its width (low standard deviation)
+    #   - Spans nearly the full width of the chat panel
+    # Message content, by contrast, has high std dev (text, bubbles, avatars).
     #
-    # Key: use a larger window (15px) to compare above vs below, so we skip
-    # over thin separator lines and find the actual brightness transition
-    # between the white message area and the darker input area.
+    # We identify candidate rows by:
+    #   1. Low row-wise standard deviation (uniform line, not message content)
+    #   2. Low brightness (dark line)
+    #   3. Above the line is bright (white message area)
+    #   4. Within reasonable distance from the bottom (input box height)
 
-    MAX_INPUT_BOX_HEIGHT = 350 if software == "wechat" else 250
+    MAX_INPUT_BOX_HEIGHT = 370 if software == "wechat" else 250
+    MIN_INPUT_BOX_HEIGHT = 70 if software == "wechat" else 40
 
     right_panel = gray[:, divider_col:]
     row_avg = np.mean(right_panel, axis=1)
+    row_std = np.std(right_panel, axis=1)
 
     # Smooth row averages to reduce noise
     row_kernel = max(3, h // 200)
@@ -401,41 +407,62 @@ def detect_chat_region(image: Image.Image, software: str = "wechat") -> ChatRegi
 
     input_top_row = 0
     scan_bottom = h - 5
-    scan_top = max(10, int(h * 0.10))
+    scan_top = max(10, int(h * 0.05))
 
-    # Method A: Find the biggest brightness drop from bottom-up.
-    # Compare a 20-row window above vs below each row.
-    # The message→input transition has the largest sustained drop.
-    best_drop = 0
-    best_r = 0
-    window_size = 20
-    for r in range(scan_bottom - window_size, scan_top + window_size, -1):
-        above_avg = np.mean(smooth_row[max(0, r - window_size) : r])
-        below_avg = np.mean(smooth_row[r : min(h, r + window_size)])
-        drop = above_avg - below_avg
+    # Method A: Find separator line using low std dev + low brightness
+    # Scan bottom-up, find the first row that looks like a uniform dark line
+    # with bright content above it.
+    candidates = []
+    for r in range(scan_bottom, scan_top, -1):
         remaining = h - r
-        # Only consider rows where the input box height is reasonable
-        if drop > best_drop and above_avg > 225 and remaining <= MAX_INPUT_BOX_HEIGHT:
-            best_drop = drop
-            best_r = r
+        if remaining > MAX_INPUT_BOX_HEIGHT or remaining < MIN_INPUT_BOX_HEIGHT:
+            continue
 
-    if best_drop > 2:
-        input_top_row = best_r
+        # A separator line has: low std dev (uniform) AND low brightness
+        if row_std[r] < 15 and row_avg[r] < 230:
+            # Check that above is bright (message area)
+            above_window = min(20, r - scan_top)
+            if above_window < 3:
+                continue
+            above_avg = np.mean(smooth_row[max(0, r - above_window) : r])
+            if above_avg > 225:
+                # Verify: region BELOW the line should be uniform (input box)
+                # while region ABOVE should be content-rich (messages)
+                below_check_end = min(h, r + remaining)
+                below_std = np.mean(row_std[r:below_check_end])
+                above_check_start = max(0, r - min(40, r))
+                above_std = np.mean(row_std[above_check_start:r])
+                # Input box has low std dev; message area has high std dev
+                if below_std < 30 and above_std > below_std:
+                    score = above_avg - row_avg[r] - row_std[r]
+                    # Bonus: prefer candidates where above std is much higher than below
+                    score += (above_std - below_std) * 0.5
+                    candidates.append((r, score))
 
-    # Method B: If no clear drop found, look for a dark separator line
+    if candidates:
+        # Pick the candidate with the highest score
+        candidates.sort(key=lambda x: (-x[1], -x[0]))
+        input_top_row = candidates[0][0]
+
+    # Method B: Find the biggest brightness drop from bottom-up
     if input_top_row == 0:
-        for r in range(scan_bottom - 1, scan_top, -1):
-            above = np.mean(smooth_row[max(0, r - 8) : r])
-            below = np.mean(smooth_row[r : min(h, r + 8)])
-            curr = smooth_row[r]
+        best_drop = 0
+        best_r = 0
+        window_size = 15
+        for r in range(scan_bottom - window_size, scan_top + window_size, -1):
+            above_avg = np.mean(smooth_row[max(0, r - window_size) : r])
+            below_avg = np.mean(smooth_row[r : min(h, r + window_size)])
+            drop = above_avg - below_avg
             remaining = h - r
-            if curr < above - 2 and curr < below - 2 and above > 225 and remaining <= MAX_INPUT_BOX_HEIGHT:
-                input_top_row = r
-                break
+            if drop > best_drop and above_avg > 220 and MIN_INPUT_BOX_HEIGHT <= remaining <= MAX_INPUT_BOX_HEIGHT:
+                best_drop = drop
+                best_r = r
+        if best_drop > 2:
+            input_top_row = best_r
 
     # Method C: Last resort fallback
     if input_top_row == 0:
-        input_top_row = max(int(h * 0.75), h - MAX_INPUT_BOX_HEIGHT)
+        input_top_row = max(int(h * 0.60), h - MAX_INPUT_BOX_HEIGHT)
 
     # --- 3. Find chat header bottom ---
     # The header is a slightly darker bar at the top of the chat panel.
@@ -542,6 +569,7 @@ class SessionState:
     capture_count: int = 0
     last_capture_time: float = 0.0
     last_change_time: float = 0.0
+    last_redetect_time: float = 0.0
     capture_mode: str = "unknown"
     last_window_rect: Optional[tuple[int, int, int, int]] = None
     first_frame: bool = True
@@ -570,7 +598,9 @@ class CaptureManager:
         self.stop_event = threading.Event()
         self.lock = threading.Lock()
 
-    def _cfg(self, key: str):
+    def _cfg(self, key: str, default=None):
+        if default is not None:
+            return self.config.get(key, DEFAULT_CONFIG.get(key, default))
         return self.config.get(key, DEFAULT_CONFIG.get(key))
 
     def _server_url(self, path: str) -> str:
@@ -698,6 +728,33 @@ class CaptureManager:
         except Exception as exc:
             log.warning("Upload failed for '%s': %s", state.session.chat_name, exc)
 
+    def _save_debug_image(self, debug_dir: str, chat_name: str, frame: Image.Image, region: ChatRegion) -> None:
+        """Save a diagnostic image with chat region overlay."""
+        try:
+            from pathlib import Path
+            out_dir = Path(debug_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            annotated = frame.copy()
+            from PIL import ImageDraw
+            draw = ImageDraw.Draw(annotated)
+            # Draw chat region rectangle (green)
+            draw.rectangle([region.left, region.top, region.right, region.bottom], outline="lime", width=3)
+            # Draw horizontal line at input_top (red)
+            draw.line([(region.left, region.bottom), (region.right, region.bottom)], fill="red", width=2)
+            # Draw horizontal line at header_bottom (blue)
+            draw.line([(region.left, region.top), (region.right, region.top)], fill="blue", width=2)
+            # Add text
+            threshold = int(region.height * self._cfg("scroll_threshold_ratio"))
+            draw.text((region.left + 5, region.top + 5),
+                      f"Chat: {region.width}x{region.height}  Threshold: {threshold}px",
+                      fill="red")
+            safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in chat_name)
+            out_path = out_dir / f"debug_{safe_name}.png"
+            annotated.save(out_path, format="PNG")
+            log.info("Debug image saved: %s", out_path)
+        except Exception as exc:
+            log.warning("Failed to save debug image: %s", exc)
+
     def _process_window(self, sct: mss, state: SessionState) -> None:
         # Re-resolve window (it may have moved or changed)
         target = resolve_window(state.session.chat_name)
@@ -718,11 +775,20 @@ class CaptureManager:
         current_frame, capture_mode = capture_window_auto(sct, target)
         state.capture_mode = capture_mode
 
-        # Detect chat region on first frame or when window moved
-        if state.chat_region is None or window_moved:
+        # Detect chat region on first frame, when window moved, or periodically
+        # (input box resize doesn't change window rect, so we re-detect every N seconds)
+        need_redetect = state.chat_region is None or window_moved
+        redetect_interval = self._cfg("redetect_interval", 10.0)
+        if not need_redetect and state.last_capture_time > 0:
+            if time.monotonic() - state.last_redetect_time >= redetect_interval:
+                need_redetect = True
+
+        if need_redetect:
             state.chat_region = detect_chat_region(current_frame, state.session.software)
+            state.last_redetect_time = time.monotonic()
             log.info(
-                "Chat region for '%s': left=%d top=%d right=%d bottom=%d (%dx%d)",
+                "Chat region for '%s': left=%d top=%d right=%d bottom=%d (%dx%d) "
+                "| window=%dx%d | threshold=%d",
                 state.session.chat_name,
                 state.chat_region.left,
                 state.chat_region.top,
@@ -730,7 +796,14 @@ class CaptureManager:
                 state.chat_region.bottom,
                 state.chat_region.width,
                 state.chat_region.height,
+                current_frame.width,
+                current_frame.height,
+                int(state.chat_region.height * self._cfg("scroll_threshold_ratio")),
             )
+            # Save diagnostic image if debug_dir is set
+            debug_dir = self._cfg("debug_dir")
+            if debug_dir:
+                self._save_debug_image(debug_dir, state.session.chat_name, current_frame, state.chat_region)
 
         # Crop to chat region
         cr = state.chat_region
@@ -1022,6 +1095,7 @@ def main() -> None:
     parser.add_argument("--scroll-ratio", type=float, default=0.4, help="Scroll threshold as ratio of chat height")
     parser.add_argument("--preview", action="store_true", help="Show chat region preview and exit")
     parser.add_argument("--gui", action="store_true", help="Show interactive window chooser GUI")
+    parser.add_argument("--debug-dir", default="", help="Save diagnostic images to this directory")
     args = parser.parse_args()
 
     if args.gui:
@@ -1038,6 +1112,7 @@ def main() -> None:
         "poll_interval": args.poll,
         "jpeg_quality": args.quality,
         "scroll_threshold_ratio": args.scroll_ratio,
+        "debug_dir": args.debug_dir,
     }
     if args.windows:
         config["windows"] = args.windows
