@@ -64,8 +64,14 @@ if hasattr(ctypes, "windll"):
         except Exception:
             pass
 
-    user32 = ctypes.windll.user32
-    gdi32 = ctypes.windll.gdi32
+    # Use separate WinDLL instances to avoid interfering with pygetwindow
+    # and other libraries that also call user32/gdi32.
+    _user32 = ctypes.WinDLL("user32")
+    _gdi32 = ctypes.WinDLL("gdi32")
+
+    user32 = ctypes.windll.user32  # shared instance for pygetwindow compatibility
+    gdi32 = _gdi32
+
     PW_RENDERFULLCONTENT = 0x00000002
 else:
     user32 = None
@@ -122,6 +128,46 @@ class WINDOWPLACEMENT(ctypes.Structure):
 
 SW_SHOWMINIMIZED = 2
 
+# Set proper argtypes/restype for 64-bit Windows compatibility.
+# Must be done AFTER structure classes are defined.
+# Uses _user32/_gdi32 (private instances) to avoid breaking pygetwindow.
+if user32 is not None:
+    _user32.GetDC.argtypes = [ctypes.c_void_p]
+    _user32.GetDC.restype = ctypes.c_void_p
+    _user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    _user32.ReleaseDC.restype = ctypes.c_int
+    _user32.GetWindowDC.argtypes = [ctypes.c_void_p]
+    _user32.GetWindowDC.restype = ctypes.c_void_p
+    _user32.PrintWindow.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
+    _user32.PrintWindow.restype = ctypes.c_int
+    _user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(RECT)]
+    _user32.GetWindowRect.restype = ctypes.c_int
+    _user32.GetWindowPlacement.argtypes = [ctypes.c_void_p, ctypes.POINTER(WINDOWPLACEMENT)]
+    _user32.GetWindowPlacement.restype = ctypes.c_int
+    _user32.IsIconic.argtypes = [ctypes.c_void_p]
+    _user32.IsIconic.restype = ctypes.c_int
+
+    _gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+    _gdi32.CreateCompatibleDC.restype = ctypes.c_void_p
+    _gdi32.CreateCompatibleBitmap.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+    _gdi32.CreateCompatibleBitmap.restype = ctypes.c_void_p
+    _gdi32.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    _gdi32.SelectObject.restype = ctypes.c_void_p
+    _gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
+    _gdi32.DeleteObject.restype = ctypes.c_int
+    _gdi32.DeleteDC.argtypes = [ctypes.c_void_p]
+    _gdi32.DeleteDC.restype = ctypes.c_int
+    _gdi32.GetDIBits.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint,
+        ctypes.c_void_p, ctypes.POINTER(BITMAPINFO), ctypes.c_uint,
+    ]
+    _gdi32.GetDIBits.restype = ctypes.c_int
+    _gdi32.BitBlt.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+    ]
+    _gdi32.BitBlt.restype = ctypes.c_int
+
 
 # ---------------------------------------------------------------------------
 # Utility functions
@@ -161,7 +207,7 @@ def resolve_window(title: str) -> Optional[WindowTarget]:
 
         if user32 is not None:
             rect = RECT()
-            if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            if _user32.GetWindowRect(hwnd, ctypes.byref(rect)):
                 width = rect.right - rect.left
                 height = rect.bottom - rect.top
                 if width > 0 and height > 0 and rect.left > -10000:
@@ -176,7 +222,7 @@ def resolve_window(title: str) -> Optional[WindowTarget]:
 
             wp = WINDOWPLACEMENT()
             wp.length = ctypes.sizeof(WINDOWPLACEMENT)
-            if user32.GetWindowPlacement(hwnd, ctypes.byref(wp)):
+            if _user32.GetWindowPlacement(hwnd, ctypes.byref(wp)):
                 r = wp.rcNormalPosition
                 width = r.right - r.left
                 height = r.bottom - r.top
@@ -214,56 +260,76 @@ def capture_window(sct: mss, target: WindowTarget) -> Image.Image:
     return Image.frombytes("RGB", shot.size, shot.rgb)
 
 
+def _printwindow_to_image(mem_dc: int, bitmap: int, width: int, height: int) -> Optional[Image.Image]:
+    """Extract image data from a PrintWindow bitmap."""
+    bmi = BITMAPINFO()
+    bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+    bmi.bmiHeader.biWidth = width
+    bmi.bmiHeader.biHeight = -height
+    bmi.bmiHeader.biPlanes = 1
+    bmi.bmiHeader.biBitCount = 32
+    bmi.bmiHeader.biCompression = 0
+
+    buffer_len = width * height * 4
+    pixel_buffer = ctypes.create_string_buffer(buffer_len)
+    rows = _gdi32.GetDIBits(
+        mem_dc, bitmap, 0, height, pixel_buffer, ctypes.byref(bmi), 0,
+    )
+    if rows != height:
+        return None
+
+    return Image.frombuffer("RGB", (width, height), pixel_buffer, "raw", "BGRX", 0, 1).copy()
+
+
 def capture_window_via_printwindow(target: WindowTarget) -> Optional[Image.Image]:
+    """Capture window using PrintWindow API. Supports background/occluded windows."""
     if user32 is None or gdi32 is None:
         return None
 
     hwnd = target.hwnd
-
-    # Since the process is DPI-aware, GetWindowRect already returns physical pixels.
-    # Use target dimensions directly for the bitmap (no additional DPI scaling).
     width = target.width
     height = target.height
 
     if width <= 0 or height <= 0:
         return None
 
-    hwnd_dc = user32.GetDC(hwnd)
-    if not hwnd_dc:
-        return None
+    for dc_func, pw_flags_list in [
+        (_user32.GetWindowDC, [PW_RENDERFULLCONTENT, 3, 0]),
+        (_user32.GetDC, [PW_RENDERFULLCONTENT, 3, 0]),
+    ]:
+        hwnd_dc = dc_func(hwnd)
+        if not hwnd_dc:
+            continue
 
-    mem_dc = gdi32.CreateCompatibleDC(hwnd_dc)
-    bitmap = gdi32.CreateCompatibleBitmap(hwnd_dc, width, height)
-    old_bitmap = gdi32.SelectObject(mem_dc, bitmap)
+        mem_dc = _gdi32.CreateCompatibleDC(hwnd_dc)
+        bitmap = _gdi32.CreateCompatibleBitmap(hwnd_dc, width, height)
+        if not bitmap:
+            _gdi32.DeleteDC(mem_dc)
+            _user32.ReleaseDC(hwnd, hwnd_dc)
+            continue
+        old_bitmap = _gdi32.SelectObject(mem_dc, bitmap)
 
-    try:
-        flags = PW_RENDERFULLCONTENT
-        result = user32.PrintWindow(target.hwnd, mem_dc, flags)
-        if result != 1:
-            return None
+        try:
+            for flags in pw_flags_list:
+                result = _user32.PrintWindow(hwnd, mem_dc, flags)
+                if result == 1:
+                    image = _printwindow_to_image(mem_dc, bitmap, width, height)
+                    if image is not None and not _is_black_image(image):
+                        return image
 
-        bmi = BITMAPINFO()
-        bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-        bmi.bmiHeader.biWidth = width
-        bmi.bmiHeader.biHeight = -height
-        bmi.bmiHeader.biPlanes = 1
-        bmi.bmiHeader.biBitCount = 32
-        bmi.bmiHeader.biCompression = 0
+            # Try BitBlt from window DC as last resort
+            result = _gdi32.BitBlt(mem_dc, 0, 0, width, height, hwnd_dc, 0, 0, 0x00CC0020)
+            if result:
+                image = _printwindow_to_image(mem_dc, bitmap, width, height)
+                if image is not None and not _is_black_image(image):
+                    return image
+        finally:
+            _gdi32.SelectObject(mem_dc, old_bitmap)
+            _gdi32.DeleteObject(bitmap)
+            _gdi32.DeleteDC(mem_dc)
+            _user32.ReleaseDC(hwnd, hwnd_dc)
 
-        buffer_len = width * height * 4
-        pixel_buffer = ctypes.create_string_buffer(buffer_len)
-        rows = gdi32.GetDIBits(
-            mem_dc, bitmap, 0, height, pixel_buffer, ctypes.byref(bmi), 0,
-        )
-        if rows != height:
-            return None
-
-        return Image.frombuffer("RGB", (width, height), pixel_buffer, "raw", "BGRX", 0, 1).copy()
-    finally:
-        gdi32.SelectObject(mem_dc, old_bitmap)
-        gdi32.DeleteObject(bitmap)
-        gdi32.DeleteDC(mem_dc)
-        user32.ReleaseDC(target.hwnd, hwnd_dc)
+    return None
 
 
 def _is_black_image(image: Image.Image, threshold: float = 5.0) -> bool:
@@ -274,8 +340,13 @@ def _is_black_image(image: Image.Image, threshold: float = 5.0) -> bool:
 def capture_window_auto(sct: mss, target: WindowTarget) -> tuple[Image.Image, str]:
     """Capture window, preferring PrintWindow for background/occluded support."""
     image = capture_window_via_printwindow(target)
-    if image is not None and not _is_black_image(image):
-        return image, "printwindow"
+    if image is not None:
+        if not _is_black_image(image):
+            return image, "printwindow"
+        else:
+            log.debug("PrintWindow returned black image for '%s', falling back to screen capture", target.title)
+    else:
+        log.debug("PrintWindow failed for '%s', falling back to screen capture", target.title)
     return capture_window(sct, target), "screen"
 
 
@@ -554,6 +625,157 @@ class ScrollEstimator:
         self.anchor_y_start = 0
 
 
+class MotionRegionDetector:
+    """Detect chat region by observing which area of the window changes.
+
+    Algorithm:
+    1. Capture frames over time
+    2. When a significant change is detected, compute the diff
+    3. Accumulate change masks across multiple events
+    4. Find the bounding box of accumulated changes in the right portion
+    5. That bounding box = chat region (scrollable area)
+
+    Why this works:
+    - When new messages arrive, the chat area scrolls → large pixel change
+    - The input box doesn't scroll → no change → naturally excluded
+    - The contact list is on the left → we prefer the right side
+    - Chat switches cause even larger changes → also detected correctly
+    """
+
+    def __init__(self, right_bias: float = 0.25, diff_threshold: int = 25,
+                 min_change_ratio: float = 0.003, min_events: int = 1) -> None:
+        self.right_bias = right_bias  # Skip left 25% of window (contact list)
+        self.diff_threshold = diff_threshold
+        self.min_change_ratio = min_change_ratio
+        self.min_events = min_events
+        self.prev_frame: Optional[np.ndarray] = None
+        self.accumulated_mask: Optional[np.ndarray] = None
+        self.event_count: int = 0
+        self.chat_region: Optional[ChatRegion] = None
+
+    def reset(self) -> None:
+        """Reset all accumulated state for fresh detection."""
+        self.prev_frame = None
+        self.accumulated_mask = None
+        self.event_count = 0
+        self.chat_region = None
+
+    def process_frame(self, image: Image.Image) -> Optional[ChatRegion]:
+        """Process a frame. Returns ChatRegion once detected, or None."""
+        arr = np.array(image.convert("RGB"))
+        h, w = arr.shape[:2]
+
+        if self.prev_frame is None:
+            self.prev_frame = arr
+            return None
+
+        # Window resized: reset accumulated data
+        if self.prev_frame.shape[:2] != (h, w):
+            self.prev_frame = arr
+            self.accumulated_mask = None
+            self.event_count = 0
+            return None
+
+        # Compute diff
+        diff = np.abs(arr.astype(np.int16) - self.prev_frame.astype(np.int16))
+        gray_diff = np.mean(diff, axis=2)
+
+        # Threshold: significant pixel change
+        mask = (gray_diff > self.diff_threshold).astype(np.uint8)
+
+        # Morphological close to fill small gaps (text characters, thin lines)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+        # Only look at right portion of window (skip contact list)
+        # Find the actual sidebar boundary by looking for a vertical gap
+        # in the change mask. The sidebar and chat area are separated by
+        # a clear vertical gap (divider line area with no changes).
+        col_sums = np.sum(mask, axis=0)  # sum of changes per column
+        col_threshold = np.max(col_sums) * 0.1  # 10% of peak = "gap"
+
+        # Scan from left to find first column with significant sustained changes
+        # that extends far to the right (chat area is wide, sidebar is narrow)
+        left_boundary = int(w * self.right_bias)  # default fallback
+        min_chat_width = int(w * 0.3)  # chat area is at least 30% of window width
+
+        for x in range(int(w * 0.1), int(w * 0.6)):
+            # Check if there are sustained changes from x to x+min_chat_width
+            if x + min_chat_width > w:
+                break
+            region_sum = np.sum(col_sums[x:x + min_chat_width])
+            if region_sum > min_chat_width * h * 0.01:  # at least 1% of area changed
+                left_boundary = x
+                break
+
+        # Filter connected components BEFORE masking left side:
+        # - Remove tiny noise (cursor blink, < 200px area) everywhere
+        # - Remove short components (< 50px height) ONLY in left/sidebar area
+        # - Keep short components in right/chat area (new messages can be short)
+        min_component_area = 200   # pixels - cursor is ~1x20=20px
+        min_component_height = 50  # pixels - sidebar preview is ~30px
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        for i in range(1, num_labels):  # skip background (label 0)
+            area = stats[i, cv2.CC_STAT_AREA]
+            height = stats[i, cv2.CC_STAT_HEIGHT]
+            cx = stats[i, cv2.CC_STAT_LEFT] + stats[i, cv2.CC_STAT_WIDTH] / 2
+            if area < min_component_area:
+                mask[labels == i] = 0
+            elif height < min_component_height and cx < left_boundary:
+                # Short component in sidebar area - filter it
+                mask[labels == i] = 0
+
+        # Now mask out the left/sidebar area
+        mask[:, :left_boundary] = 0
+
+        # Check if enough pixels changed after filtering
+        change_ratio = np.sum(mask) / mask.size
+        if change_ratio < self.min_change_ratio:
+            self.prev_frame = arr
+            return None
+
+        # Accumulate change mask
+        if self.accumulated_mask is None:
+            self.accumulated_mask = mask
+        else:
+            self.accumulated_mask = cv2.bitwise_or(self.accumulated_mask, mask)
+
+        self.event_count += 1
+        self.prev_frame = arr
+
+        if self.event_count < self.min_events:
+            return None
+
+        # Find bounding box of accumulated changes
+        coords = cv2.findNonZero(self.accumulated_mask)
+        if coords is None:
+            return None
+
+        x, y, bw, bh = cv2.boundingRect(coords)
+
+        # Chat area spans from the leftmost change to the window right edge.
+        # Use the detected left boundary (not a fixed ratio) so we don't
+        # cut off content that's left of the 25% mark.
+        new_region = ChatRegion(
+            left=int(x),                   # actual detected left boundary
+            top=int(y),
+            right=int(w),                   # window right edge
+            bottom=int(y + bh),
+        )
+
+        # Region only grows, never shrinks
+        if self.chat_region is not None:
+            new_region = ChatRegion(
+                left=min(self.chat_region.left, new_region.left),
+                top=min(self.chat_region.top, new_region.top),
+                right=max(self.chat_region.right, new_region.right),
+                bottom=max(self.chat_region.bottom, new_region.bottom),
+            )
+
+        self.chat_region = new_region
+        return self.chat_region
+
+
 # ---------------------------------------------------------------------------
 # 5. Accumulated Scroll + Threshold Trigger + Full Chat Capture
 # ---------------------------------------------------------------------------
@@ -565,6 +787,7 @@ class SessionState:
     chat_region: Optional[ChatRegion] = None
     previous_chat_frame: Optional[Image.Image] = None
     scroll_estimator: ScrollEstimator = field(default=None)
+    motion_detector: MotionRegionDetector = field(default=None)
     accumulated_scroll: int = 0
     capture_count: int = 0
     last_capture_time: float = 0.0
@@ -573,6 +796,8 @@ class SessionState:
     capture_mode: str = "unknown"
     last_window_rect: Optional[tuple[int, int, int, int]] = None
     first_frame: bool = True
+    calibrating: bool = True  # Start in calibration mode by default
+    anchor_lost_time: Optional[float] = None  # When anchor was first lost
 
 
 def encode_jpeg(image: Image.Image, quality: int = 60) -> str:
@@ -631,6 +856,8 @@ class CaptureManager:
                     session=session,
                     target=target,
                     scroll_estimator=ScrollEstimator(self.config),
+                    motion_detector=MotionRegionDetector(),
+                    calibrating=True,
                 )
                 self.states[title] = state
                 self._register_session(state)
@@ -759,7 +986,6 @@ class CaptureManager:
         # Re-resolve window (it may have moved or changed)
         target = resolve_window(state.session.chat_name)
         if target is None:
-            # Try original title from config
             for title, s in self.states.items():
                 if s is state:
                     target = resolve_window(title)
@@ -775,38 +1001,90 @@ class CaptureManager:
         current_frame, capture_mode = capture_window_auto(sct, target)
         state.capture_mode = capture_mode
 
-        # Detect chat region on first frame, when window moved, or periodically
-        # (input box resize doesn't change window rect, so we re-detect every N seconds)
-        need_redetect = state.chat_region is None or window_moved
-        redetect_interval = self._cfg("redetect_interval", 10.0)
-        if not need_redetect and state.last_capture_time > 0:
-            if time.monotonic() - state.last_redetect_time >= redetect_interval:
-                need_redetect = True
+        # --- Calibration mode: detect chat region via motion observation ---
+        if state.calibrating:
+            if state.motion_detector is None:
+                state.motion_detector = MotionRegionDetector()
 
-        if need_redetect:
-            state.chat_region = detect_chat_region(current_frame, state.session.software)
-            state.last_redetect_time = time.monotonic()
-            log.info(
-                "Chat region for '%s': left=%d top=%d right=%d bottom=%d (%dx%d) "
-                "| window=%dx%d | threshold=%d",
-                state.session.chat_name,
-                state.chat_region.left,
-                state.chat_region.top,
-                state.chat_region.right,
-                state.chat_region.bottom,
-                state.chat_region.width,
-                state.chat_region.height,
-                current_frame.width,
-                current_frame.height,
-                int(state.chat_region.height * self._cfg("scroll_threshold_ratio")),
-            )
-            # Save diagnostic image if debug_dir is set
-            debug_dir = self._cfg("debug_dir")
-            if debug_dir:
-                self._save_debug_image(debug_dir, state.session.chat_name, current_frame, state.chat_region)
+            region = state.motion_detector.process_frame(current_frame)
+
+            if region is not None:
+                # Only expand, never shrink
+                if state.chat_region is not None:
+                    region = ChatRegion(
+                        left=min(state.chat_region.left, region.left),
+                        top=min(state.chat_region.top, region.top),
+                        right=max(state.chat_region.right, region.right),
+                        bottom=max(state.chat_region.bottom, region.bottom),
+                    )
+                state.chat_region = region
+                state.calibrating = False
+                state.last_redetect_time = time.monotonic()
+                log.info(
+                    "Calibration complete for '%s': left=%d top=%d right=%d bottom=%d (%dx%d) "
+                    "| events=%d",
+                    state.session.chat_name,
+                    region.left, region.top, region.right, region.bottom,
+                    region.width, region.height,
+                    state.motion_detector.event_count,
+                )
+                debug_dir = self._cfg("debug_dir")
+                if debug_dir:
+                    self._save_debug_image(debug_dir, state.session.chat_name, current_frame, region)
+            else:
+                if state.motion_detector.event_count == 0:
+                    log.info("Calibrating '%s': waiting for content changes...",
+                             state.session.chat_name)
+                else:
+                    log.debug("Calibrating '%s': %d change events observed, need %d more",
+                              state.session.chat_name,
+                              state.motion_detector.event_count,
+                              state.motion_detector.min_events - state.motion_detector.event_count)
+            return
+
+        # --- Normal mode: use detected chat region ---
+        # Re-detect if window moved
+        if window_moved:
+            state.calibrating = True
+            state.motion_detector = MotionRegionDetector()
+            # Don't reset chat_region to None - keep it as initial hint
+            state.previous_chat_frame = None
+            state.first_frame = True
+            log.info("Window moved, re-calibrating '%s'", state.session.chat_name)
+            return
+
+        # No periodic re-calibration - region only grows, never shrinks
+        # Re-calibration only happens on window move (see above)
+
+        # Continue motion detection to grow the region
+        if state.motion_detector is not None:
+            new_region = state.motion_detector.process_frame(current_frame)
+            if new_region is not None and state.chat_region is not None:
+                # Only expand, never shrink
+                expanded = ChatRegion(
+                    left=min(state.chat_region.left, new_region.left),
+                    top=min(state.chat_region.top, new_region.top),
+                    right=max(state.chat_region.right, new_region.right),
+                    bottom=max(state.chat_region.bottom, new_region.bottom),
+                )
+                if (expanded.left != state.chat_region.left or
+                    expanded.top != state.chat_region.top or
+                    expanded.right != state.chat_region.right or
+                    expanded.bottom != state.chat_region.bottom):
+                    log.info(
+                        "Chat region expanded for '%s': (%d,%d,%d,%d) -> (%d,%d,%d,%d)",
+                        state.session.chat_name,
+                        state.chat_region.left, state.chat_region.top,
+                        state.chat_region.right, state.chat_region.bottom,
+                        expanded.left, expanded.top, expanded.right, expanded.bottom,
+                    )
+                    state.chat_region = expanded
+
+        cr = state.chat_region
+        if cr is None:
+            return
 
         # Crop to chat region
-        cr = state.chat_region
         chat_frame = current_frame.crop((cr.left, cr.top, cr.right, cr.bottom))
 
         # First frame: always capture and set anchor
@@ -824,9 +1102,9 @@ class CaptureManager:
         scroll_delta = state.scroll_estimator.estimate_scroll(chat_frame)
 
         if scroll_delta is not None and abs(scroll_delta) >= 2:
-            # Scroll detected
             state.accumulated_scroll += scroll_delta
             state.last_change_time = time.monotonic()
+            state.anchor_lost_time = None  # Anchor is working, clear lost timer
             log.debug(
                 "Scroll delta=%d accumulated=%d (threshold=%d) '%s'",
                 scroll_delta,
@@ -835,10 +1113,31 @@ class CaptureManager:
                 state.session.chat_name,
             )
         elif _frames_differ(state.previous_chat_frame, chat_frame):
-            # Content changed but no scroll detected (e.g., new message, typing indicator)
-            state.last_change_time = time.monotonic()
-            # Treat as a small scroll to ensure eventual capture
-            state.accumulated_scroll += 1
+            # Anchor lost but content changed significantly (e.g. chat switch)
+            # Wait 1 second of continuous anchor loss before resetting
+            now = time.monotonic()
+            if state.anchor_lost_time is None:
+                state.anchor_lost_time = now
+                log.info("Anchor lost for '%s', waiting 1s before reset...",
+                         state.session.chat_name)
+            elif now - state.anchor_lost_time >= 1.0:
+                state.last_change_time = now
+                log.info(
+                    "Anchor lost for 1s, re-detecting chat region for '%s'",
+                    state.session.chat_name,
+                )
+                state.accumulated_scroll = 0
+                state.anchor_lost_time = None
+                # Don't set anchor yet - wait for new chat region to be detected first
+                state.scroll_estimator.anchor = None
+                state.previous_chat_frame = None
+                state.first_frame = True
+                # Reset motion detector and chat region for fresh detection
+                state.motion_detector = MotionRegionDetector()
+                state.chat_region = None
+                state.calibrated = False
+                state.calibrating = True
+            return
 
         # Update anchor from current frame for next comparison
         state.scroll_estimator.set_anchor(chat_frame)
