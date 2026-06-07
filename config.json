@@ -1,6 +1,6 @@
 {
   "poll_interval": 0.5,
-  "jpeg_quality": 60,
+  "webp_quality": 60,
   "anchor_top_ratio": 0.70,
   "anchor_bottom_ratio": 0.90,
   "search_top_ratio": 0.30,

@@ -22,7 +22,7 @@ CONFIG_PATH = Path("config.json")
 
 DEFAULT_REMOTE_CONFIG = {
     "poll_interval": 0.5,
-    "jpeg_quality": 60,
+    "webp_quality": 60,
     "anchor_top_ratio": 0.70,
     "anchor_bottom_ratio": 0.90,
     "search_top_ratio": 0.30,
@@ -60,12 +60,12 @@ class FrameUpload(BaseModel):
     software: str = Field(min_length=1, max_length=64)
     chat_name: str = Field(min_length=1, max_length=256)
     chat_rect: Optional[dict[str, int]] = None
-    image_jpeg_base64: str = Field(min_length=0)
+    image_webp_base64: str = Field(min_length=0)
 
 
 class ConfigUpdate(BaseModel):
     poll_interval: Optional[float] = None
-    jpeg_quality: Optional[int] = None
+    webp_quality: Optional[int] = None
     anchor_top_ratio: Optional[float] = None
     anchor_bottom_ratio: Optional[float] = None
     search_top_ratio: Optional[float] = None
@@ -124,7 +124,7 @@ def _save_config(config: dict[str, Any]) -> None:
 
 
 def _load_session_frames(session_id: str) -> list[tuple[Path, dict[str, Any]]]:
-    """Load all frames for a session, sorted by sequence. Returns [(jpg_path, meta_dict)]."""
+    """Load all frames for a session, sorted by sequence. Returns [(webp_path, meta_dict)]."""
     session_dir = STORAGE_ROOT / session_id
     if not session_dir.exists():
         return []
@@ -134,9 +134,9 @@ def _load_session_frames(session_id: str) -> list[tuple[Path, dict[str, Any]]]:
             continue
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         stem = meta_path.stem
-        jpg_path = session_dir / f"{stem}.jpg"
-        if jpg_path.exists():
-            frames.append((jpg_path, meta))
+        webp_path = session_dir / f"{stem}.webp"
+        if webp_path.exists():
+            frames.append((webp_path, meta))
     return frames
 
 
@@ -235,8 +235,8 @@ def _stitch_frames(frames: list[tuple[Path, dict[str, Any]]]) -> Optional[Image.
         return None
 
     images = []
-    for jpg_path, _ in frames:
-        img = Image.open(jpg_path).convert("RGB")
+    for webp_path, _ in frames:
+        img = Image.open(webp_path).convert("RGB")
         images.append(img)
 
     if len(images) == 1:
@@ -340,14 +340,14 @@ def upload_frame(frame: FrameUpload) -> dict[str, Any]:
     session_dir.mkdir(parents=True, exist_ok=True)
 
     # Determine sequence from existing frames
-    existing = sorted(session_dir.glob("*.jpg"))
+    existing = sorted(session_dir.glob("*.webp"))
     sequence = len(existing)
 
-    image_bytes = _decode_image(frame.image_jpeg_base64)
+    image_bytes = _decode_image(frame.image_webp_base64)
     sha256 = hashlib.sha256(image_bytes).hexdigest()
     stem = f"{sequence:08d}_{sha256[:12]}"
 
-    image_path = session_dir / f"{stem}.jpg"
+    image_path = session_dir / f"{stem}.webp"
     meta_path = session_dir / f"{stem}.json"
 
     if image_path.exists():
@@ -420,8 +420,8 @@ def reconstruct_session(session_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail="stitching failed")
 
     # Save stitched image
-    out_path = session_dir / "reconstructed.jpg"
-    stitched.save(out_path, format="JPEG", quality=90, optimize=True)
+    out_path = session_dir / "reconstructed.webp"
+    stitched.save(out_path, format="WEBP", quality=90)
 
     return {
         "status": "reconstructed",
@@ -449,10 +449,9 @@ def reconstruct_session_image(session_id: str) -> StreamingResponse:
         raise HTTPException(status_code=500, detail="stitching failed")
 
     buf = io.BytesIO()
-    stitched.save(buf, format="JPEG", quality=90, optimize=True)
+    stitched.save(buf, format="WEBP", quality=90)
     buf.seek(0)
-
-    return StreamingResponse(buf, media_type="image/jpeg")
+    return StreamingResponse(buf, media_type="image/webp")
 
 
 @app.get("/api/session/{session_id}/reconstruct/overlap")

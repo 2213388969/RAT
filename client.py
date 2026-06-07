@@ -33,7 +33,7 @@ log = logging.getLogger("capture")
 DEFAULT_CONFIG = {
     "server_url": "http://127.0.0.1:8000",
     "poll_interval": 0.5,
-    "jpeg_quality": 60,
+    "webp_quality": 60,
     # Scroll estimator
     "anchor_top_ratio": 0.70,
     "anchor_bottom_ratio": 0.90,
@@ -800,9 +800,9 @@ class SessionState:
     anchor_lost_time: Optional[float] = None  # When anchor was first lost
 
 
-def encode_jpeg(image: Image.Image, quality: int = 60) -> str:
+def encode_webp(image: Image.Image, quality: int = 60) -> str:
     buffer = io.BytesIO()
-    image.save(buffer, format="JPEG", quality=quality, optimize=True)
+    image.save(buffer, format="WEBP", quality=quality)
     return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
@@ -935,7 +935,7 @@ class CaptureManager:
             }
             if state.chat_region
             else None,
-            "image_jpeg_base64": encode_jpeg(chat_image, self._cfg("jpeg_quality")),
+            "image_webp_base64": encode_webp(chat_image, self._cfg("webp_quality")),
         }
         try:
             resp = requests.post(
@@ -1390,7 +1390,7 @@ def main() -> None:
     parser.add_argument("--server", default="http://127.0.0.1:8000", help="Server URL")
     parser.add_argument("--windows", nargs="+", default=[], help="Window titles to monitor")
     parser.add_argument("--poll", type=float, default=0.5, help="Poll interval in seconds")
-    parser.add_argument("--quality", type=int, default=60, help="JPEG quality")
+    parser.add_argument("--quality", type=int, default=60, help="WebP quality")
     parser.add_argument("--scroll-ratio", type=float, default=0.4, help="Scroll threshold as ratio of chat height")
     parser.add_argument("--preview", action="store_true", help="Show chat region preview and exit")
     parser.add_argument("--gui", action="store_true", help="Show interactive window chooser GUI")
@@ -1409,7 +1409,7 @@ def main() -> None:
     config = {
         "server_url": args.server,
         "poll_interval": args.poll,
-        "jpeg_quality": args.quality,
+        "webp_quality": args.quality,
         "scroll_threshold_ratio": args.scroll_ratio,
         "debug_dir": args.debug_dir,
     }
