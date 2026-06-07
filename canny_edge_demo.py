@@ -84,6 +84,28 @@ def strongest_diff_index(values, start, end):
     return start + int(np.argmax(window))
 
 
+def detect_chat_left_boundary(gray):
+    height, width = gray.shape
+    y0 = int(height * 0.14)
+    y1 = int(height * 0.82)
+    profile = gray[y0:y1, :].astype(np.float32).mean(axis=0)
+    profile_diff = np.abs(np.diff(profile))
+
+    search_start = int(width * 0.20)
+    search_end = int(width * 0.60)
+    window = profile_diff[search_start:search_end]
+    max_score = float(window.max())
+    threshold = max(12.0, max_score * 0.60)
+    candidates = [
+        search_start + idx
+        for idx, score in enumerate(window)
+        if float(score) >= threshold
+    ]
+    if candidates:
+        return candidates[0]
+    return strongest_diff_index(profile_diff, search_start, search_end)
+
+
 def detect_chat_bounds(gray):
     height, width = gray.shape
     main_x_start = int(width * 0.22)
@@ -100,7 +122,7 @@ def detect_chat_bounds(gray):
     edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 50, 150)
     col_edge_counts = edges[120:, :].sum(axis=0) // 255
 
-    chat_left_x = strongest_diff_index(col_diff, int(width * 0.24), int(width * 0.36))
+    chat_left_x = detect_chat_left_boundary(gray)
     chat_right_x = strongest_diff_index(col_edge_counts, width - 40, width - 2)
     chat_top_y = strongest_diff_index(row_diff, 90, 220)
 
@@ -121,7 +143,7 @@ def detect_input_top_line(image, chat_left_x, chat_right_x):
     roi_x0 = max(int(width * 0.26), chat_left_x - 20)
     roi_x1 = width - 10
     roi_y0 = int(height * 0.60)
-    roi_y1 = int(height * 0.90)
+    roi_y1 = int(height * 0.96)
 
     roi = image[roi_y0:roi_y1, roi_x0:roi_x1]
 
@@ -150,7 +172,7 @@ def detect_input_top_line(image, chat_left_x, chat_right_x):
                 continue
 
             global_y = roi_y0 + (y1 + y2) // 2
-            if not (int(height * 0.62) <= global_y <= int(height * 0.78)):
+            if not (int(height * 0.62) <= global_y <= int(height * 0.95)):
                 continue
 
             start_x = roi_x0 + min(x1, x2)
