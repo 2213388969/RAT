@@ -6,7 +6,7 @@
   "search_top_ratio": 0.30,
   "search_bottom_ratio": 0.90,
   "match_confidence_threshold": 0.70,
-  "scroll_threshold_ratio": 0.6,
+  "scroll_threshold_ratio": 0.8,
   "no_scroll_capture_timeout": 60.0,
   "config_poll_interval": 30,
   "windows": [
