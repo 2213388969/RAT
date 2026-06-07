@@ -46,7 +46,7 @@ DEFAULT_CONFIG = {
     # Config poll
     "config_poll_interval": 30,
     # Windows to monitor
-    "windows": ["微信"],
+    "windows": [],
 }
 
 # ---------------------------------------------------------------------------
@@ -1177,7 +1177,7 @@ class CaptureManager:
                     with self.lock:
                         remote_windows = remote.pop("windows", None)
                         self.config.update(remote)
-                        if remote_windows is not None:
+                        if remote_windows is not None and not self.config.get("windows_override"):
                             local_windows = self.config.get("windows", [])
                             merged = list(dict.fromkeys(local_windows + remote_windows))
                             self.config["windows"] = merged
@@ -1415,6 +1415,7 @@ def main() -> None:
     }
     if args.windows:
         config["windows"] = args.windows
+        config["windows_override"] = True  # CLI override: don't merge with server
 
     manager = CaptureManager(config)
     manager.start()
