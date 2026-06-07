@@ -77,6 +77,11 @@ class ConfigUpdate(BaseModel):
     windows: Optional[list[str]] = None
 
 
+class TitleStripUpload(BaseModel):
+    session_id: str = Field(min_length=1, max_length=128)
+    image_webp_base64: str = Field(min_length=0)
+
+
 class WindowsUpdate(BaseModel):
     windows: list[str]
 
@@ -317,6 +322,21 @@ def get_session(session_id: str) -> dict[str, Any]:
     if not meta_path.exists():
         raise HTTPException(status_code=404, detail="session not found")
     return json.loads(meta_path.read_text(encoding="utf-8"))
+
+
+@app.post("/api/session/{session_id}/title")
+def upload_title_strip(session_id: str, data: TitleStripUpload) -> dict[str, Any]:
+    """Upload the 60px title strip image for a session."""
+    session_id = _sanitize_session_id(session_id)
+    session_dir = STORAGE_ROOT / session_id
+    if not session_dir.exists():
+        raise HTTPException(status_code=404, detail="session not found")
+
+    image_bytes = _decode_image(data.image_webp_base64)
+    title_path = session_dir / "title.webp"
+    title_path.write_bytes(image_bytes)
+
+    return {"status": "stored", "session_id": session_id, "title_path": os.fspath(title_path)}
 
 
 @app.get("/api/sessions")

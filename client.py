@@ -955,6 +955,28 @@ class CaptureManager:
         except Exception as exc:
             log.warning("Upload failed for '%s': %s", state.session.chat_name, exc)
 
+    def _upload_title_strip(self, state: SessionState, title_strip: Image.Image) -> None:
+        """Upload the 60px title strip from the top of the chat region."""
+        payload = {
+            "session_id": state.session.session_id,
+            "image_webp_base64": encode_webp(title_strip, self._cfg("webp_quality")),
+        }
+        try:
+            resp = requests.post(
+                self._server_url("/api/session/{}/title".format(state.session.session_id)),
+                json=payload,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            log.info(
+                "Title strip uploaded for '%s' (%dx%d)",
+                state.session.chat_name,
+                title_strip.width,
+                title_strip.height,
+            )
+        except Exception as exc:
+            log.warning("Title strip upload failed for '%s': %s", state.session.chat_name, exc)
+
     def _save_debug_image(self, debug_dir: str, chat_name: str, frame: Image.Image, region: ChatRegion) -> None:
         """Save a diagnostic image with chat region overlay."""
         try:
@@ -1087,8 +1109,14 @@ class CaptureManager:
         # Crop to chat region
         chat_frame = current_frame.crop((cr.left, cr.top, cr.right, cr.bottom))
 
-        # First frame: always capture and set anchor
+        # First frame: capture title strip, then always capture and set anchor
         if state.first_frame or state.previous_chat_frame is None:
+            # Capture a 60px tall strip just above the chat region top (likely the title bar)
+            # Width spans the full window
+            title_height = min(60, cr.top)
+            title_strip = current_frame.crop((0, cr.top - title_height, current_frame.width, cr.top))
+            self._upload_title_strip(state, title_strip)
+
             state.previous_chat_frame = chat_frame
             state.scroll_estimator.set_anchor(chat_frame)
             state.accumulated_scroll = 0
