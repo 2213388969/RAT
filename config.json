@@ -1,15 +1,26 @@
 {
-  "poll_interval": 0.5,
+  "poll_interval": 0.25,
   "webp_quality": 60,
   "anchor_top_ratio": 0.70,
-  "anchor_bottom_ratio": 0.90,
-  "search_top_ratio": 0.30,
-  "search_bottom_ratio": 0.90,
+  "anchor_bottom_ratio": 1.00,
+  "search_top_ratio": 0.00,
+  "search_bottom_ratio": 1.00,
   "match_confidence_threshold": 0.70,
-  "scroll_threshold_ratio": 0.8,
+  "scroll_threshold_ratio": 0.75,
   "no_scroll_capture_timeout": 60.0,
   "config_poll_interval": 30,
-  "windows": [
-    "微信"
-  ]
+  "windows": [],
+  "_comments": {
+    "poll_interval": "截图轮询间隔（秒），每隔多久检查一次窗口变化",
+    "webp_quality": "WebP图片压缩质量（1-100），越高质量越好体积越大",
+    "anchor_top_ratio": "锚点区域上边界比例（相对聊天区域高度），用于滚动检测的锚点选取范围",
+    "anchor_bottom_ratio": "锚点区域下边界比例（相对聊天区域高度），用于滚动检测的锚点选取范围",
+    "search_top_ratio": "模板匹配搜索区域上边界比例（相对聊天区域高度），限制匹配搜索范围",
+    "search_bottom_ratio": "模板匹配搜索区域下边界比例（相对聊天区域高度），限制匹配搜索范围",
+    "match_confidence_threshold": "模板匹配置信度阈值（0-1），低于此值认为锚点丢失",
+    "scroll_threshold_ratio": "触发截图的累计滚动比例（相对聊天区域高度），如0.75表示滚动超过区域高度75%时截图",
+    "no_scroll_capture_timeout": "无滚动时超时自动截图的秒数（当前已禁用）",
+    "config_poll_interval": "从服务器拉取配置更新的间隔（秒）",
+    "windows": "要监控的窗口标题列表，如 [\"微信\", \"QQ\"]"
+  }
 }

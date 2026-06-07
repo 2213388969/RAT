@@ -79,6 +79,8 @@ class ConfigUpdate(BaseModel):
 
 class TitleStripUpload(BaseModel):
     session_id: str = Field(min_length=1, max_length=128)
+    software: str = Field(min_length=1, max_length=64)
+    timestamp: float
     image_webp_base64: str = Field(min_length=0)
 
 
@@ -333,7 +335,9 @@ def upload_title_strip(session_id: str, data: TitleStripUpload) -> dict[str, Any
         raise HTTPException(status_code=404, detail="session not found")
 
     image_bytes = _decode_image(data.image_webp_base64)
-    title_path = session_dir / "title.webp"
+    dt = datetime.fromtimestamp(data.timestamp)
+    time_str = dt.strftime("%Y-%m-%d %H-%M-%S")
+    title_path = session_dir / f"{session_id}_{time_str}_title.webp"
     title_path.write_bytes(image_bytes)
 
     return {"status": "stored", "session_id": session_id, "title_path": os.fspath(title_path)}
@@ -365,7 +369,11 @@ def upload_frame(frame: FrameUpload) -> dict[str, Any]:
 
     image_bytes = _decode_image(frame.image_webp_base64)
     sha256 = hashlib.sha256(image_bytes).hexdigest()
-    stem = f"{sequence:08d}_{sha256[:12]}"
+
+    # Build filename: 会话序号_时间
+    dt = datetime.fromtimestamp(frame.timestamp)
+    time_str = dt.strftime("%Y-%m-%d %H-%M-%S")
+    stem = f"{session_id}_{time_str}"
 
     image_path = session_dir / f"{stem}.webp"
     meta_path = session_dir / f"{stem}.json"

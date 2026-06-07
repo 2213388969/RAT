@@ -580,13 +580,18 @@ class ScrollEstimator:
         self.anchor: Optional[np.ndarray] = None
         self.anchor_y_start: int = 0
 
+    # Width of the right-aligned anchor strip (pixels).
+    # Using a fixed width avoids anchor mismatch when chat region left boundary changes.
+    ANCHOR_STRIP_WIDTH = 256
+
     def set_anchor(self, chat_image: Image.Image) -> None:
-        """Extract anchor region from the bottom portion of the chat image."""
+        """Extract anchor region from the bottom-right portion of the chat image."""
         arr = np.array(chat_image.convert("RGB"))
-        h = arr.shape[0]
+        h, w = arr.shape[:2]
         y_start = int(h * self.config.get("anchor_top_ratio", 0.70))
         y_end = int(h * self.config.get("anchor_bottom_ratio", 0.90))
-        self.anchor = arr[y_start:y_end].copy()
+        x_start = max(0, w - self.ANCHOR_STRIP_WIDTH)
+        self.anchor = arr[y_start:y_end, x_start:w].copy()
         self.anchor_y_start = y_start
 
     def estimate_scroll(self, chat_image: Image.Image) -> Optional[int]:
@@ -601,10 +606,12 @@ class ScrollEstimator:
         h, w = arr.shape[:2]
         ah, aw = self.anchor.shape[:2]
 
+        # Only search in the right-aligned strip
+        x_start = max(0, w - self.ANCHOR_STRIP_WIDTH)
         search_top = int(h * self.config.get("search_top_ratio", 0.30))
         search_bottom = int(h * self.config.get("search_bottom_ratio", 0.90))
 
-        search_region = arr[search_top:search_bottom]
+        search_region = arr[search_top:search_bottom, x_start:w]
 
         if search_region.shape[0] < ah or search_region.shape[1] < aw:
             return None
@@ -652,6 +659,7 @@ class MotionRegionDetector:
         self.accumulated_mask: Optional[np.ndarray] = None
         self.event_count: int = 0
         self.chat_region: Optional[ChatRegion] = None
+        self.sidebar_boundary: int = 0  # detected sidebar/chat divider x position
 
     def reset(self) -> None:
         """Reset all accumulated state for fresh detection."""
@@ -727,6 +735,7 @@ class MotionRegionDetector:
 
         # Now mask out the left/sidebar area
         mask[:, :left_boundary] = 0
+        self.sidebar_boundary = left_boundary  # store for external use
 
         # Check if enough pixels changed after filtering
         change_ratio = np.sum(mask) / mask.size
@@ -807,7 +816,12 @@ def encode_webp(image: Image.Image, quality: int = 60) -> str:
 
 
 def _frames_differ(prev: Image.Image, curr: Image.Image, threshold: float = 3.0) -> bool:
-    diff = ImageChops.difference(prev, curr)
+    # Right-align frames so left boundary changes don't cause false positives
+    w = min(prev.width, curr.width)
+    h = min(prev.height, curr.height)
+    prev_r = prev.crop((prev.width - w, 0, prev.width, h))
+    curr_r = curr.crop((curr.width - w, 0, curr.width, h))
+    diff = ImageChops.difference(prev_r, curr_r)
     stat = ImageStat.Stat(diff.convert("L"))
     return stat.mean[0] > threshold
 
@@ -959,6 +973,8 @@ class CaptureManager:
         """Upload the 60px title strip from the top of the chat region."""
         payload = {
             "session_id": state.session.session_id,
+            "software": state.session.software,
+            "timestamp": time.time(),
             "image_webp_base64": encode_webp(title_strip, self._cfg("webp_quality")),
         }
         try:
@@ -1065,26 +1081,16 @@ class CaptureManager:
             return
 
         # --- Normal mode: use detected chat region ---
-        # Re-detect if window moved
-        if window_moved:
-            state.calibrating = True
-            state.motion_detector = MotionRegionDetector()
-            # Don't reset chat_region to None - keep it as initial hint
-            state.previous_chat_frame = None
-            state.first_frame = True
-            log.info("Window moved, re-calibrating '%s'", state.session.chat_name)
-            return
-
-        # No periodic re-calibration - region only grows, never shrinks
-        # Re-calibration only happens on window move (see above)
 
         # Continue motion detection to grow the region
+        # Left boundary can expand leftward but not past the sidebar divider
         if state.motion_detector is not None:
             new_region = state.motion_detector.process_frame(current_frame)
             if new_region is not None and state.chat_region is not None:
-                # Only expand, never shrink
+                # Expand region; left boundary can grow leftward up to sidebar divider
+                min_left = state.motion_detector.sidebar_boundary
                 expanded = ChatRegion(
-                    left=min(state.chat_region.left, new_region.left),
+                    left=max(min_left, min(state.chat_region.left, new_region.left)),
                     top=min(state.chat_region.top, new_region.top),
                     right=max(state.chat_region.right, new_region.right),
                     bottom=max(state.chat_region.bottom, new_region.bottom),
