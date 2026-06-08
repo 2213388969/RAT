@@ -668,6 +668,49 @@ class MotionRegionDetector:
         self.event_count = 0
         self.chat_region = None
 
+    def detect_sidebar_from_image(self, image: Image.Image) -> int:
+        """Detect the vertical divider line between sidebar and chat area
+        using edge detection on a single image. Returns the x position
+        of the divider, or 0 if not found."""
+        arr = np.array(image.convert("RGB"))
+        h, w = arr.shape[:2]
+        gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+
+        # Vertical edge detection
+        edges = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        edge_mag = np.abs(edges)
+
+        mask = (edge_mag > 30).astype(np.uint8)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+        col_sums = np.sum(mask, axis=0)
+        max_col = np.max(col_sums)
+
+        min_sidebar_width = int(w * 0.08)
+        max_sidebar_width = int(w * 0.85)
+
+        left_boundary = 0
+        if max_col > 0:
+            peak_threshold = max_col * 0.9
+            max_peak_width = 5
+
+            for x in range(min_sidebar_width, max_sidebar_width):
+                if col_sums[x] >= peak_threshold:
+                    peak_start = x
+                    peak_end = x
+                    while peak_end < max_sidebar_width and col_sums[peak_end] >= peak_threshold:
+                        peak_end += 1
+                    peak_width = peak_end - peak_start
+                    if peak_width <= max_peak_width:
+                        left_boundary = peak_start + peak_width // 2
+                        break
+                    else:
+                        x = peak_end
+
+        self.sidebar_boundary = left_boundary
+        return left_boundary
+
     def process_frame(self, image: Image.Image) -> Optional[ChatRegion]:
         """Process a frame. Returns ChatRegion once detected, or None."""
         arr = np.array(image.convert("RGB"))
@@ -695,28 +738,10 @@ class MotionRegionDetector:
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
-        # Only look at right portion of window (skip contact list)
-        # Find the actual sidebar boundary by looking for a vertical gap
-        # in the change mask. The sidebar and chat area are separated by
-        # a clear vertical gap (divider line area with no changes).
-        col_sums = np.sum(mask, axis=0)  # sum of changes per column
-        col_threshold = np.max(col_sums) * 0.1  # 10% of peak = "gap"
+        # Use pre-detected sidebar boundary (from detect_sidebar_from_image)
+        left_boundary = self.sidebar_boundary
 
-        # Scan from left to find first column with significant sustained changes
-        # that extends far to the right (chat area is wide, sidebar is narrow)
-        left_boundary = int(w * self.right_bias)  # default fallback
-        min_chat_width = int(w * 0.3)  # chat area is at least 30% of window width
-
-        for x in range(int(w * 0.1), int(w * 0.6)):
-            # Check if there are sustained changes from x to x+min_chat_width
-            if x + min_chat_width > w:
-                break
-            region_sum = np.sum(col_sums[x:x + min_chat_width])
-            if region_sum > min_chat_width * h * 0.01:  # at least 1% of area changed
-                left_boundary = x
-                break
-
-        # Filter connected components BEFORE masking left side:
+        # Filter connected components:
         # - Remove tiny noise (cursor blink, < 200px area) everywhere
         # - Remove short components (< 50px height) ONLY in left/sidebar area
         # - Keep short components in right/chat area (new messages can be short)
@@ -1044,9 +1069,26 @@ class CaptureManager:
             if state.motion_detector is None:
                 state.motion_detector = MotionRegionDetector()
 
+            # Detect sidebar boundary if not yet detected
+            if state.motion_detector.sidebar_boundary == 0:
+                boundary = state.motion_detector.detect_sidebar_from_image(current_frame)
+                if boundary > 0:
+                    log.info("Sidebar boundary for '%s': x=%d", state.session.chat_name, boundary)
+                else:
+                    log.info("No sidebar boundary detected for '%s'", state.session.chat_name)
+
             region = state.motion_detector.process_frame(current_frame)
 
             if region is not None:
+                # Fix width to span the full right portion (sidebar_boundary -> window right)
+                sb = state.motion_detector.sidebar_boundary
+                w = np.array(current_frame.convert("RGB")).shape[1]
+                region = ChatRegion(
+                    left=sb,
+                    top=region.top,
+                    right=w,
+                    bottom=region.bottom,
+                )
                 # Only expand, never shrink
                 if state.chat_region is not None:
                     region = ChatRegion(
@@ -1082,17 +1124,26 @@ class CaptureManager:
 
         # --- Normal mode: use detected chat region ---
 
-        # Continue motion detection to grow the region
-        # Left boundary can expand leftward but not past the sidebar divider
-        if state.motion_detector is not None:
+        # Periodically re-detect sidebar boundary and chat region (every 60s)
+        # to handle user resizing. Only expand, never shrink.
+        if (state.motion_detector is not None
+                and time.monotonic() - state.last_redetect_time >= 60):
+            # Re-detect sidebar
+            old_boundary = state.motion_detector.sidebar_boundary
+            new_boundary = state.motion_detector.detect_sidebar_from_image(current_frame)
+            if new_boundary != old_boundary:
+                log.info("Sidebar boundary changed for '%s': %d -> %d",
+                         state.session.chat_name, old_boundary, new_boundary)
+
+            # Re-detect chat region via motion
             new_region = state.motion_detector.process_frame(current_frame)
             if new_region is not None and state.chat_region is not None:
-                # Expand region; left boundary can grow leftward up to sidebar divider
-                min_left = state.motion_detector.sidebar_boundary
+                sb = state.motion_detector.sidebar_boundary
+                w = np.array(current_frame.convert("RGB")).shape[1]
                 expanded = ChatRegion(
-                    left=max(min_left, min(state.chat_region.left, new_region.left)),
+                    left=min(state.chat_region.left, sb),
                     top=min(state.chat_region.top, new_region.top),
-                    right=max(state.chat_region.right, new_region.right),
+                    right=max(state.chat_region.right, w),
                     bottom=max(state.chat_region.bottom, new_region.bottom),
                 )
                 if (expanded.left != state.chat_region.left or
@@ -1107,6 +1158,7 @@ class CaptureManager:
                         expanded.left, expanded.top, expanded.right, expanded.bottom,
                     )
                     state.chat_region = expanded
+            state.last_redetect_time = time.monotonic()
 
         cr = state.chat_region
         if cr is None:
@@ -1118,9 +1170,10 @@ class CaptureManager:
         # First frame: capture title strip, then always capture and set anchor
         if state.first_frame or state.previous_chat_frame is None:
             # Capture a 60px tall strip just above the chat region top (likely the title bar)
-            # Width spans the full window
+            # Crop left sidebar if detected
+            title_left = state.motion_detector.sidebar_boundary if state.motion_detector else 0
             title_height = min(60, cr.top)
-            title_strip = current_frame.crop((0, cr.top - title_height, current_frame.width, cr.top))
+            title_strip = current_frame.crop((title_left, cr.top - title_height, current_frame.width, cr.top))
             self._upload_title_strip(state, title_strip)
 
             state.previous_chat_frame = chat_frame
