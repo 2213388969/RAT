@@ -694,8 +694,12 @@ class MotionRegionDetector:
         if max_col > 0:
             peak_threshold = max_col * 0.9
             max_peak_width = 5
+            center_x = w // 2
 
-            for x in range(min_sidebar_width, max_sidebar_width):
+            # Collect all candidate peaks
+            candidates = []
+            x = min_sidebar_width
+            while x < max_sidebar_width:
                 if col_sums[x] >= peak_threshold:
                     peak_start = x
                     peak_end = x
@@ -703,10 +707,15 @@ class MotionRegionDetector:
                         peak_end += 1
                     peak_width = peak_end - peak_start
                     if peak_width <= max_peak_width:
-                        left_boundary = peak_start + peak_width // 2
-                        break
-                    else:
-                        x = peak_end
+                        peak_center = peak_start + peak_width // 2
+                        candidates.append(peak_center)
+                    x = peak_end
+                else:
+                    x += 1
+
+            # Pick the candidate closest to window center
+            if candidates:
+                left_boundary = min(candidates, key=lambda cx: abs(cx - center_x))
 
         self.sidebar_boundary = left_boundary
         return left_boundary
@@ -832,6 +841,8 @@ class SessionState:
     first_frame: bool = True
     calibrating: bool = True  # Start in calibration mode by default
     anchor_lost_time: Optional[float] = None  # When anchor was first lost
+    prev_frame_size: Optional[tuple[int, int]] = None  # (width, height) to detect resize
+    paused: bool = False  # True when window is minimized or not renderable
 
 
 def encode_webp(image: Image.Image, quality: int = 60) -> str:
@@ -1045,6 +1056,40 @@ class CaptureManager:
         except Exception as exc:
             log.warning("Failed to save debug image: %s", exc)
 
+    # Map window title keywords to process names for app detection
+    APP_PROCESS_MAP = {
+        "微信": ["WeChat.exe", "WeChatApp.exe"],
+        "QQ": ["QQ.exe"],
+        "Telegram": ["telegram.exe"],
+    }
+
+    def _is_app_running(self, window_title: str) -> bool:
+        """Check if the application process is still running (window may be closed to tray)."""
+        try:
+            import psutil
+        except ImportError:
+            # Without psutil, assume app is running (don't pause)
+            return True
+
+        # Find matching process names from the map
+        process_names = None
+        for keyword, procs in self.APP_PROCESS_MAP.items():
+            if keyword in window_title:
+                process_names = procs
+                break
+
+        if process_names is None:
+            # Unknown app, assume still running
+            return True
+
+        for proc in psutil.process_iter(["name"]):
+            try:
+                if proc.info["name"] in process_names:
+                    return True
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        return False
+
     def _process_window(self, sct: mss, state: SessionState) -> None:
         # Re-resolve window (it may have moved or changed)
         target = resolve_window(state.session.chat_name)
@@ -1054,15 +1099,68 @@ class CaptureManager:
                     target = resolve_window(title)
                     break
         if target is None:
-            log.debug("Window for '%s' not found", state.session.chat_name)
+            # Window not found: could be closed-to-tray or app exited
+            if not state.paused:
+                # Check if the app process is still running
+                app_running = self._is_app_running(state.session.chat_name)
+                if app_running:
+                    log.info("Window '%s' closed to tray, pausing capture",
+                             state.session.chat_name)
+                else:
+                    log.info("App '%s' exited, pausing capture",
+                             state.session.chat_name)
+                state.paused = True
             return
 
         state.target = target
         window_moved = self._check_window_moved(state)
 
+        # Check if window is minimized — skip capture to save resources
+        if _user32.IsIconic(target.hwnd):
+            if not state.paused:
+                log.info("Window '%s' is minimized, pausing capture",
+                         state.session.chat_name)
+                state.paused = True
+            return
+        elif state.paused:
+            log.info("Window '%s' restored, resuming capture",
+                     state.session.chat_name)
+            state.paused = False
+
         # Capture window
         current_frame, capture_mode = capture_window_auto(sct, target)
         state.capture_mode = capture_mode
+
+        # Check if captured frame is all black (window not renderable)
+        if _is_black_image(current_frame):
+            if not state.paused:
+                log.info("Window '%s' not renderable (black frame), pausing capture",
+                         state.session.chat_name)
+                state.paused = True
+            return
+        elif state.paused:
+            log.info("Window '%s' renderable again, resuming capture",
+                     state.session.chat_name)
+            state.paused = False
+
+        # Detect window resize: if frame size changed, re-calibrate
+        frame_w, frame_h = current_frame.size
+        if (state.prev_frame_size is not None
+                and state.prev_frame_size != (frame_w, frame_h)):
+            log.info("Window resized for '%s': %dx%d -> %dx%d, re-calibrating",
+                     state.session.chat_name,
+                     state.prev_frame_size[0], state.prev_frame_size[1],
+                     frame_w, frame_h)
+            state.accumulated_scroll = 0
+            state.anchor_lost_time = None
+            state.scroll_estimator.anchor = None
+            state.previous_chat_frame = None
+            state.first_frame = True
+            state.motion_detector = MotionRegionDetector()
+            state.chat_region = None
+            state.calibrated = False
+            state.calibrating = True
+        state.prev_frame_size = (frame_w, frame_h)
 
         # --- Calibration mode: detect chat region via motion observation ---
         if state.calibrating:
@@ -1083,11 +1181,12 @@ class CaptureManager:
                 # Fix width to span the full right portion (sidebar_boundary -> window right)
                 sb = state.motion_detector.sidebar_boundary
                 w = np.array(current_frame.convert("RGB")).shape[1]
+                h = np.array(current_frame.convert("RGB")).shape[0]
                 region = ChatRegion(
                     left=sb,
-                    top=region.top,
+                    top=max(0, region.top - 5),
                     right=w,
-                    bottom=region.bottom,
+                    bottom=min(h, region.bottom + 5),
                 )
                 # Only expand, never shrink
                 if state.chat_region is not None:
@@ -1124,34 +1223,45 @@ class CaptureManager:
 
         # --- Normal mode: use detected chat region ---
 
-        # Periodically re-detect sidebar boundary and chat region (every 60s)
-        # to handle user resizing. Only expand, never shrink.
+        # Periodically re-detect sidebar boundary (every 60s)
+        # to handle user resizing. Chat region width always = window width - sidebar.
         if (state.motion_detector is not None
                 and time.monotonic() - state.last_redetect_time >= 60):
-            # Re-detect sidebar
             old_boundary = state.motion_detector.sidebar_boundary
             new_boundary = state.motion_detector.detect_sidebar_from_image(current_frame)
-            if new_boundary != old_boundary:
+            if new_boundary > 0 and new_boundary != old_boundary:
                 log.info("Sidebar boundary changed for '%s': %d -> %d",
                          state.session.chat_name, old_boundary, new_boundary)
+                state.motion_detector.sidebar_boundary = new_boundary
+                # Immediately update chat region width
+                if state.chat_region is not None:
+                    w = np.array(current_frame.convert("RGB")).shape[1]
+                    state.chat_region = ChatRegion(
+                        left=new_boundary,
+                        top=state.chat_region.top,
+                        right=w,
+                        bottom=state.chat_region.bottom,
+                    )
+                    log.info("Chat region width updated for '%s': left=%d right=%d",
+                             state.session.chat_name, new_boundary, w)
+                    # Reset anchor since frame width changed
+                    state.scroll_estimator.anchor = None
 
-            # Re-detect chat region via motion
+            # Re-detect chat region height via motion (only expand)
             new_region = state.motion_detector.process_frame(current_frame)
             if new_region is not None and state.chat_region is not None:
                 sb = state.motion_detector.sidebar_boundary
                 w = np.array(current_frame.convert("RGB")).shape[1]
                 expanded = ChatRegion(
-                    left=min(state.chat_region.left, sb),
+                    left=sb,
                     top=min(state.chat_region.top, new_region.top),
-                    right=max(state.chat_region.right, w),
+                    right=w,
                     bottom=max(state.chat_region.bottom, new_region.bottom),
                 )
-                if (expanded.left != state.chat_region.left or
-                    expanded.top != state.chat_region.top or
-                    expanded.right != state.chat_region.right or
+                if (expanded.top != state.chat_region.top or
                     expanded.bottom != state.chat_region.bottom):
                     log.info(
-                        "Chat region expanded for '%s': (%d,%d,%d,%d) -> (%d,%d,%d,%d)",
+                        "Chat region height expanded for '%s': (%d,%d,%d,%d) -> (%d,%d,%d,%d)",
                         state.session.chat_name,
                         state.chat_region.left, state.chat_region.top,
                         state.chat_region.right, state.chat_region.bottom,
@@ -1173,8 +1283,9 @@ class CaptureManager:
             # Crop left sidebar if detected
             title_left = state.motion_detector.sidebar_boundary if state.motion_detector else 0
             title_height = min(60, cr.top)
-            title_strip = current_frame.crop((title_left, cr.top - title_height, current_frame.width, cr.top))
-            self._upload_title_strip(state, title_strip)
+            if title_height > 0:
+                title_strip = current_frame.crop((title_left, cr.top - title_height, current_frame.width, cr.top))
+                self._upload_title_strip(state, title_strip)
 
             state.previous_chat_frame = chat_frame
             state.scroll_estimator.set_anchor(chat_frame)

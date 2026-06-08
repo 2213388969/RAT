@@ -49,26 +49,34 @@ def detect_sidebar_boundary(image_path: str):
 
     left_boundary = 0
     if max_col > 0:
-        # A divider peak should be: very high (>= 60% of max) and very narrow (<= 5px wide)
+        # A divider peak should be: very high (>= 90% of max) and very narrow (<= 5px wide)
         peak_threshold = max_col * 0.9
         max_peak_width = 5
+        center_x = w // 2
 
-        for x in range(min_sidebar_width, max_sidebar_width):
+        # Collect all candidate peaks
+        candidates = []
+        x = min_sidebar_width
+        while x < max_sidebar_width:
             if col_sums_mask[x] >= peak_threshold:
-                # Found a tall column - check if it's narrow (a spike, not a wide region)
                 peak_start = x
                 peak_end = x
                 while peak_end < max_sidebar_width and col_sums_mask[peak_end] >= peak_threshold:
                     peak_end += 1
                 peak_width = peak_end - peak_start
                 if peak_width <= max_peak_width:
-                    # Narrow tall spike = divider line
-                    peak_height = col_sums_mask[peak_start + peak_width // 2]
-                    print(f"Divider detected: width={peak_width}px, height={peak_height:.0f} (max={max_col:.0f}, ratio={peak_height/max_col:.2f})")
-                    left_boundary = peak_start + peak_width // 2  # center of the line
-                    break
-                else:
-                    x = peak_end  # skip this wide region
+                    peak_center = peak_start + peak_width // 2
+                    peak_height = col_sums_mask[peak_center]
+                    print(f"Divider candidate at x={peak_center}: width={peak_width}px, height={peak_height:.0f} (max={max_col:.0f}, ratio={peak_height/max_col:.2f})")
+                    candidates.append(peak_center)
+                x = peak_end
+            else:
+                x += 1
+
+        # Pick the candidate closest to window center
+        if candidates:
+            left_boundary = min(candidates, key=lambda cx: abs(cx - center_x))
+            print(f"Selected divider at x={left_boundary} (closest to center x={center_x})")
 
     # Draw result
     result = arr.copy()
