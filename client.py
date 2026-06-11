@@ -573,26 +573,95 @@ class ScrollEstimator:
     3. Use OpenCV matchTemplate (TM_CCOEFF_NORMED)
     4. scroll_delta = anchor_old_y - best_y
        Positive = content scrolled up (new messages appeared at bottom)
-    """
 
-    def __init__(self, config: dict) -> None:
-        self.config = config
-        self.anchor: Optional[np.ndarray] = None
-        self.anchor_y_start: int = 0
+    Dynamic content (GIF/video) handling:
+    - When setting anchor, divide the anchor strip into horizontal bands
+      and pick the most stable one (least change from previous frame).
+    - Track consecutive anchor loss count; after N losses, switch to
+      periodic screenshot fallback mode.
+    - In fallback mode, attempt to find a new stable anchor on each frame;
+      once found, exit fallback automatically.
+    """
 
     # Width of the right-aligned anchor strip (pixels).
     # Using a fixed width avoids anchor mismatch when chat region left boundary changes.
     ANCHOR_STRIP_WIDTH = 256
 
+    # Number of horizontal bands to divide the anchor region for stability analysis
+    ANCHOR_BAND_COUNT = 5
+
+    # Consecutive anchor losses before entering fallback (periodic screenshot) mode
+    FALLBACK_ANCHOR_LOSS_COUNT = 5
+
+    # Periodic screenshot interval in fallback mode (seconds)
+    FALLBACK_CAPTURE_INTERVAL = 5.0
+
+    def __init__(self, config: dict) -> None:
+        self.config = config
+        self.anchor: Optional[np.ndarray] = None
+        self.anchor_y_start: int = 0
+        self.prev_anchor_strip: Optional[np.ndarray] = None  # for stability analysis
+        self.consecutive_anchor_losses: int = 0
+        self.fallback_mode: bool = False
+        self.last_fallback_capture: float = 0.0
+
     def set_anchor(self, chat_image: Image.Image) -> None:
-        """Extract anchor region from the bottom-right portion of the chat image."""
+        """Extract anchor region from the bottom-right portion of the chat image.
+
+        When dynamic content (GIF/video) is present, the anchor strip may
+        contain regions that change every frame. We divide the strip into
+        horizontal bands and select the most stable one (least difference
+        from the previous anchor strip).
+        """
         arr = np.array(chat_image.convert("RGB"))
         h, w = arr.shape[:2]
         y_start = int(h * self.config.get("anchor_top_ratio", 0.70))
         y_end = int(h * self.config.get("anchor_bottom_ratio", 0.90))
         x_start = max(0, w - self.ANCHOR_STRIP_WIDTH)
-        self.anchor = arr[y_start:y_end, x_start:w].copy()
-        self.anchor_y_start = y_start
+
+        full_strip = arr[y_start:y_end, x_start:w].copy()
+
+        # If we have a previous anchor strip, check for dynamic content
+        use_band = False
+        if self.prev_anchor_strip is not None and self.prev_anchor_strip.shape == full_strip.shape:
+            strip_h = full_strip.shape[0]
+            band_h = max(1, strip_h // self.ANCHOR_BAND_COUNT)
+            band_diffs = []
+
+            for i in range(self.ANCHOR_BAND_COUNT):
+                by_start = i * band_h
+                by_end = min((i + 1) * band_h, strip_h)
+                if by_end <= by_start:
+                    band_diffs.append(0.0)
+                    continue
+                band_curr = full_strip[by_start:by_end]
+                band_prev = self.prev_anchor_strip[by_start:by_end]
+                diff = np.mean(np.abs(band_curr.astype(np.int16) - band_prev.astype(np.int16)))
+                band_diffs.append(diff)
+
+            # Only use band-based anchor if there's actual dynamic content:
+            # at least one band has significantly higher diff than the minimum
+            min_diff = min(band_diffs)
+            max_diff = max(band_diffs)
+            # Dynamic content threshold: the worst band is at least 3x the best band
+            # AND the worst band has meaningful pixel change (> 2.0 per channel)
+            if max_diff > min_diff * 3 and max_diff > 2.0:
+                use_band = True
+                best_band_idx = band_diffs.index(min_diff)
+                by_start = best_band_idx * band_h
+                by_end = min((best_band_idx + 1) * band_h, strip_h)
+                self.anchor = full_strip[by_start:by_end].copy()
+                self.anchor_y_start = y_start + by_start
+                log.debug("Anchor set from band %d/%d (diff=%.1f, max_diff=%.1f) at y=%d [dynamic content detected]",
+                          best_band_idx + 1, self.ANCHOR_BAND_COUNT, min_diff, max_diff, self.anchor_y_start)
+
+        if not use_band:
+            # No dynamic content detected: use full strip for reliable matching
+            self.anchor = full_strip.copy()
+            self.anchor_y_start = y_start
+
+        # Store current strip for next comparison
+        self.prev_anchor_strip = full_strip
 
     def estimate_scroll(self, chat_image: Image.Image) -> Optional[int]:
         """Estimate scroll delta between anchor and current frame.
@@ -627,9 +696,42 @@ class ScrollEstimator:
         scroll_delta = self.anchor_y_start - best_y
         return scroll_delta
 
+    def record_anchor_result(self, found: bool) -> None:
+        """Record whether anchor matching succeeded this frame.
+
+        After consecutive_anchor_losses >= FALLBACK_ANCHOR_LOSS_COUNT,
+        enters fallback mode (periodic screenshots).
+        """
+        if found:
+            self.consecutive_anchor_losses = 0
+            if self.fallback_mode:
+                log.info("Stable anchor recovered, exiting fallback mode")
+                self.fallback_mode = False
+        else:
+            self.consecutive_anchor_losses += 1
+            if (not self.fallback_mode and
+                    self.consecutive_anchor_losses >= self.FALLBACK_ANCHOR_LOSS_COUNT):
+                log.info("Anchor lost %d consecutive times, entering fallback mode (periodic screenshots)",
+                         self.consecutive_anchor_losses)
+                self.fallback_mode = True
+                self.last_fallback_capture = time.monotonic()
+
+    def should_fallback_capture(self) -> bool:
+        """Check if a periodic fallback capture should be taken now."""
+        if not self.fallback_mode:
+            return False
+        now = time.monotonic()
+        if now - self.last_fallback_capture >= self.FALLBACK_CAPTURE_INTERVAL:
+            self.last_fallback_capture = now
+            return True
+        return False
+
     def reset(self) -> None:
         self.anchor = None
         self.anchor_y_start = 0
+        self.prev_anchor_strip = None
+        self.consecutive_anchor_losses = 0
+        self.fallback_mode = False
 
 
 class MotionRegionDetector:
@@ -754,17 +856,24 @@ class MotionRegionDetector:
         # - Remove tiny noise (cursor blink, < 200px area) everywhere
         # - Remove short components (< 50px height) ONLY in left/sidebar area
         # - Keep short components in right/chat area (new messages can be short)
+        # - Remove small-area components in right/chat area (likely GIF/video, < 15% of chat width)
         min_component_area = 200   # pixels - cursor is ~1x20=20px
         min_component_height = 50  # pixels - sidebar preview is ~30px
+        min_chat_component_width_ratio = 0.15  # chat area components must span >= 15% of chat width
+        chat_width = w - left_boundary
         num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
         for i in range(1, num_labels):  # skip background (label 0)
             area = stats[i, cv2.CC_STAT_AREA]
             height = stats[i, cv2.CC_STAT_HEIGHT]
             cx = stats[i, cv2.CC_STAT_LEFT] + stats[i, cv2.CC_STAT_WIDTH] / 2
+            comp_width = stats[i, cv2.CC_STAT_WIDTH]
             if area < min_component_area:
                 mask[labels == i] = 0
             elif height < min_component_height and cx < left_boundary:
                 # Short component in sidebar area - filter it
+                mask[labels == i] = 0
+            elif cx >= left_boundary and comp_width < chat_width * min_chat_component_width_ratio:
+                # Narrow component in chat area - likely GIF/video, filter it
                 mask[labels == i] = 0
 
         # Now mask out the left/sidebar area
@@ -1303,6 +1412,7 @@ class CaptureManager:
             state.accumulated_scroll += scroll_delta
             state.last_change_time = time.monotonic()
             state.anchor_lost_time = None  # Anchor is working, clear lost timer
+            state.scroll_estimator.record_anchor_result(True)
             log.debug(
                 "Scroll delta=%d accumulated=%d (threshold=%d) '%s'",
                 scroll_delta,
@@ -1311,7 +1421,22 @@ class CaptureManager:
                 state.session.chat_name,
             )
         elif _frames_differ(state.previous_chat_frame, chat_frame):
-            # Anchor lost but content changed significantly (e.g. chat switch)
+            # Anchor lost but content changed significantly
+            state.scroll_estimator.record_anchor_result(False)
+
+            # In fallback mode: take periodic screenshots regardless of anchor status
+            if state.scroll_estimator.should_fallback_capture():
+                self._upload_capture(state, chat_frame, 0)
+                log.info("Fallback capture for '%s' (dynamic content suspected)",
+                         state.session.chat_name)
+
+            # In fallback mode: always update anchor so we can detect when
+            # dynamic content scrolls away and a stable anchor becomes available
+            if state.scroll_estimator.fallback_mode:
+                state.scroll_estimator.set_anchor(chat_frame)
+                state.previous_chat_frame = chat_frame
+                return
+
             # Wait 1 second of continuous anchor loss before resetting
             now = time.monotonic()
             if state.anchor_lost_time is None:
@@ -1336,6 +1461,9 @@ class CaptureManager:
                 state.calibrated = False
                 state.calibrating = True
             return
+        else:
+            # No scroll and no frame difference: anchor is stable
+            state.scroll_estimator.record_anchor_result(True)
 
         # Update anchor from current frame for next comparison
         state.scroll_estimator.set_anchor(chat_frame)
